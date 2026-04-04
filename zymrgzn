@@ -1,0 +1,194 @@
+from flask import Flask, render_template, request, jsonify
+import base64
+from io import BytesIO
+from PIL import Image
+from model import *
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    # ========== 改成你的学号和姓名 ==========
+    student_id = "202335020659"
+    student_name = "周宇默"
+    return render_template('index.html', student_id=student_id, student_name=student_name)
+
+@app.route('/transfer', methods=['POST'])
+def transfer():
+    try:
+        data = request.get_json()
+
+        # 兼容base64格式，防止报错
+        def get_b64(s):
+            return s.split(',')[1] if ',' in s else s
+
+        content_b64 = get_b64(data['content'])
+        style_b64 = get_b64(data['style'])
+        style_weight = int(data.get('weight', 1000000))
+        steps = int(data.get('steps', 200))  # 降低默认步数，CPU友好
+
+        # 解码图片
+        content_img = Image.open(BytesIO(base64.b64decode(content_b64))).convert('RGB')
+        style_img = Image.open(BytesIO(base64.b64decode(style_b64))).convert('RGB')
+
+        # 转张量
+        content_tensor = image_to_tensor(content_img)
+        style_tensor = image_to_tensor(style_img)
+        input_tensor = content_tensor.clone()
+
+        # 真正的AI风格迁移
+        output = run_style_transfer(
+            cnn, cnn_normalization_mean, cnn_normalization_std,
+            content_tensor, style_tensor, input_tensor,
+            num_steps=steps, style_weight=style_weight
+        )
+
+        # 转图片返回
+        out_img = tensor_to_image(output)
+        buf = BytesIO()
+        out_img.save(buf, format='PNG')
+        res_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        return jsonify({"result": f"data:image/png;base64,{res_b64}"})
+
+    except Exception as e:
+        print("错误信息：", str(e))
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import Image
+import torchvision.transforms as T
+import torchvision.models as models
+from torchvision.models import VGG19_Weights  # 修复警告+兼容新版torch
+
+# 自动选择设备，CPU/GPU都能跑
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 用官方推荐的weights参数，消除警告，同时加载预训练模型
+cnn = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features.to(device).eval()
+
+# 标准化参数（VGG19专用）
+cnn_normalization_mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
+cnn_normalization_std = torch.tensor([0.229, 0.224, 0.225]).to(device)
+
+# 标准化层
+class Normalization(nn.Module):
+    def __init__(self, mean, std):
+        super(Normalization, self).__init__()
+        self.mean = mean.view(-1, 1, 1)
+        self.std = std.view(-1, 1, 1)
+    def forward(self, img):
+        return (img - self.mean) / self.std
+
+# 损失函数定义
+content_layers_default = ['conv_4']
+style_layers_default = ['conv_1', 'conv_2', 'conv_3', 'conv_4', 'conv_5']
+
+def get_style_model_and_losses(cnn, normalization_mean, normalization_std,
+                               style_img, content_img,
+                               content_layers=content_layers_default,
+                               style_layers=style_layers_default):
+    normalization = Normalization(normalization_mean, normalization_std)
+    content_losses = []
+    style_losses = []
+    model = nn.Sequential(normalization)
+    i = 0
+    for layer in cnn.children():
+        if isinstance(layer, nn.Conv2d):
+            i += 1
+            name = 'conv_{}'.format(i)
+        elif isinstance(layer, nn.ReLU):
+            name = 'relu_{}'.format(i)
+            layer = nn.ReLU(inplace=False)
+        elif isinstance(layer, nn.MaxPool2d):
+            name = 'pool_{}'.format(i)
+        elif isinstance(layer, nn.BatchNorm2d):
+            name = 'bn_{}'.format(i)
+        else:
+            raise RuntimeError(f"Unrecognized layer: {layer.__class__.__name__}")
+        model.add_module(name, layer)
+
+        if name in content_layers:
+            target = model(content_img).detach()
+            content_loss = ContentLoss(target)
+            model.add_module(f"content_loss_{i}", content_loss)
+            content_losses.append(content_loss)
+
+        if name in style_layers:
+            target_feature = model(style_img).detach()
+            style_loss = StyleLoss(target_feature)
+            model.add_module(f"style_loss_{i}", style_loss)
+            style_losses.append(style_loss)
+
+    # 截断多余层，减少内存占用
+    for i in range(len(model) - 1, -1, -1):
+        if isinstance(model[i], ContentLoss) or isinstance(model[i], StyleLoss):
+            break
+    model = model[:(i + 1)]
+    return model, style_losses, content_losses
+
+class ContentLoss(nn.Module):
+    def __init__(self, target):
+        super(ContentLoss, self).__init__()
+        self.target = target.detach()
+    def forward(self, input):
+        self.loss = nn.functional.mse_loss(input, self.target)
+        return input
+
+class StyleLoss(nn.Module):
+    def __init__(self, target_feature):
+        super(StyleLoss, self).__init__()
+        self.target = self.gram_matrix(target_feature).detach()
+    def gram_matrix(self, x):
+        a, b, c, d = x.size()
+        features = x.view(a * b, c * d)
+        G = torch.mm(features, features.t())
+        return G.div(a * b * c * d)
+    def forward(self, input):
+        G = self.gram_matrix(input)
+        self.loss = nn.functional.mse_loss(G, self.target)
+        return input
+
+# 优化版风格迁移：降低默认步数，减少内存占用，CPU友好
+def run_style_transfer(cnn, normalization_mean, normalization_std,
+                       content_img, style_img, input_img,
+                       num_steps=200, style_weight=1e6, content_weight=1):
+    model, style_losses, content_losses = get_style_model_and_losses(
+        cnn, normalization_mean, normalization_std, style_img, content_img)
+    # 只优化输入图像，不训练模型，减少内存
+    optimizer = optim.LBFGS([input_img.requires_grad_(True)])
+    run = [0]
+    while run[0] <= num_steps:
+        def closure():
+            input_img.data.clamp_(0, 1)
+            optimizer.zero_grad(set_to_none=True)  # 释放内存
+            model(input_img)
+            score_style = sum(sl.loss for sl in style_losses)
+            score_content = sum(cl.loss for cl in content_losses)
+            loss = score_style * style_weight + score_content * content_weight
+            loss.backward()
+            run[0] += 1
+            return loss
+        optimizer.step(closure)
+    input_img.data.clamp_(0, 1)
+    # 主动清理缓存，防止闪退
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return input_img
+
+# 图像预处理：降低分辨率到256，CPU秒跑，不闪退
+def image_to_tensor(img):
+    transform = T.Compose([
+        T.Resize((256, 256)),  # 从512降到256，内存占用砍半，速度翻倍
+        T.ToTensor()
+    ])
+    return transform(img).unsqueeze(0).to(device)
+
+def tensor_to_image(tensor):
+    img = tensor.cpu().clone().squeeze(0)
+    img = T.ToPILImage()(img)
+    return img
