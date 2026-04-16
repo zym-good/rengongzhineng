@@ -1,0 +1,36 @@
+# 1. 导入库
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+# 2. 构造模拟数据（y = 2x + 3 + 噪声）
+np.random.seed(42)
+x = np.linspace(0, 10, 100)  # 输入：0~10 的100个点
+y_true = 2 * x + 3  # 真实关系
+y_noise = y_true + np.random.randn(*x.shape) * 0.8  # 加噪声
+
+# 3. 搭建线性回归模型
+model = tf.keras.Sequential([
+    tf.keras.layers.Dense(1, input_shape=(1,))  # 全连接层，输出1个值
+])
+
+# 4. 编译模型
+model.compile(
+    optimizer=tf.keras.optimizers.SGD(learning_rate=0.01),  # 随机梯度下降
+    loss='mse'  # 均方误差损失
+)
+
+# 5. 训练模型
+history = model.fit(x, y_noise, epochs=100, verbose=1)
+
+# 6. 查看训练好的参数
+w, b = model.layers[0].get_weights()
+print(f"训练得到的权重 w = {w[0][0]:.2f}")
+print(f"训练得到的偏置 b = {b[0]:.2f}")
+print(f"真实值：w=2，b=3")
+
+# 7. 预测并画图
+y_pred = model.predict(x)
+plt.scatter(x, y_noise, label='带噪声的真实数据')
+plt.plot(x, y_pred, 'r-', label='模型拟合直线')
+plt.legend()
+plt.show()
